@@ -1,0 +1,22 @@
+# LLM
+google-generativeai
+
+# Agent framework
+langchain
+langgraph
+langchain-google-genai
+
+# Data analysis
+pandas
+numpy
+duckdb
+
+# Statistics / ML
+scikit-learn
+
+# Visualization
+matplotlib
+
+# Configuration / utilities
+pyyaml
+python-dotenv
