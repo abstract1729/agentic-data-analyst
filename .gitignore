@@ -170,3 +170,9 @@ data/*.db
 # =========================
 results/*
 !results/.gitkeep
+
+# =========================
+# Runtime logs
+# =========================
+logs/*
+!logs/.gitkeep

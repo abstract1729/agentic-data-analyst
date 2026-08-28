@@ -1,4 +1,7 @@
 from typing import Annotated, TypedDict
+import time
+import uuid
+from datetime import datetime, timezone
 
 from langchain_core.messages import BaseMessage
 from langchain_core.tools import StructuredTool
@@ -114,58 +117,134 @@ DATABASE SCHEMA:
         self.iteration_count = 0
 
         # ---------------------------------------------------------
+        # Latencies
+        # ---------------------------------------------------------
+        self.llm_latencies = []
+        self.tool_latencies = {}
+        self.total_latency = 0.0
+
+        # ---------------------------------------------------------
+        # Query Stats
+        # ---------------------------------------------------------
+        self.tools_used = []
+        self.status = None
+        self.error = None
+
+        self.request_id = None
+        self.timestamp = None
+        self.question = None
+
+        # ---------------------------------------------------------
         # Graph
         # ---------------------------------------------------------
 
         self.graph = self._build_graph()
 
     # =============================================================
+    # Utility Functions
+    # =============================================================
+
+    def _reset_metrics(self):
+        self.request_id = str(uuid.uuid4())
+        self.timestamp = datetime.now(timezone.utc).isoformat()
+
+        self.llm_call_count = 0
+        self.tool_call_count = 0
+        self.iteration_count = 0
+
+        self.llm_latencies = []
+        self.tool_latencies = {}
+
+        self.tools_used = []
+
+        self.total_latency = 0.0
+
+        self.status = None
+        self.error = None
+
+    def _timed_sql_tool(self):
+        def execute_sql_timed(query: str) -> str:
+            start_time = time.perf_counter()
+            try:
+                return self.tools_backend.execute_sql(query)
+            finally:
+                latency = time.perf_counter() - start_time
+                self.tool_latencies.setdefault("execute_sql",[]).append(latency)
+        return execute_sql_timed
+
+    def _timed_python_tool(self):
+        def execute_python_timed(code: str) -> str:
+            start_time = time.perf_counter()
+            try:
+                return self.tools_backend.execute_python(code)
+
+            finally:
+                latency = time.perf_counter() - start_time
+                self.tool_latencies.setdefault("execute_python",[]).append(latency)
+
+        return execute_python_timed
+    
+    # =============================================================
     # Tool definitions
     # =============================================================
 
     def _build_tools(self):
-
-        sql_tool = StructuredTool.from_function(
-            func=self.tools_backend.execute_sql,
-            name="execute_sql",
-            description=(
-                "Execute a read-only SQL query against the "
+        sql_tool = StructuredTool.from_function(func=self._timed_sql_tool(),name="execute_sql",
+            description=("Execute a read-only SQL query against the "
                 "DuckDB database. Use SQL for filtering, "
                 "aggregation, grouping, joins, sorting, "
                 "and temporal analysis."
             ),
         )
 
-        python_tool = StructuredTool.from_function(
-            func=self.tools_backend.execute_python,
-            name="execute_python",
-            description=(
-                "Execute Python/Pandas analysis against the "
+        python_tool = StructuredTool.from_function(func=self._timed_python_tool(),name="execute_python",
+            description=("Execute Python/Pandas analysis against the "
                 "available database tables. Use this for "
                 "statistical or dataframe-oriented analysis. "
                 "The final output must be stored in a variable "
                 "named `result`."
             ),
         )
-
-        return [sql_tool,python_tool]
+        
+        return [sql_tool,python_tool,]
 
     # =============================================================
     # LLM node
     # =============================================================
 
     def _call_model(self, state: AgentState):
-        # One invocation of this node = one LLM API request.
+
         self.llm_call_count += 1
-
-        # For the current baseline, each LLM invocation is
-        # considered one agent iteration.
         self.iteration_count += 1
-        response = self.llm_with_tools.invoke(state["messages"])
 
-        # Count every tool call requested by this LLM response.
-        self.tool_call_count += len(response.tool_calls)
-        return {"messages": [response]}
+        start_time = time.perf_counter()
+
+        try:
+
+            response = self.llm_with_tools.invoke(
+                state["messages"]
+            )
+
+            self.tool_call_count += len(
+                response.tool_calls
+            )
+
+            for tool_call in response.tool_calls:
+                tool_name = tool_call["name"]
+                self.tools_used.append(tool_name)
+
+            return {
+                "messages": [response]
+            }
+
+        finally:
+
+            latency = (
+                time.perf_counter()
+                - start_time
+            )
+
+            self.llm_latencies.append(latency)
 
     # =============================================================
     # Graph
@@ -206,33 +285,41 @@ DATABASE SCHEMA:
     # =============================================================
 
     def invoke(self, question: str):
+        self._reset_metrics()
+        self.question = question
+        request_start = time.perf_counter()
 
-        # Reset per-question metrics.
-        self.llm_call_count = 0
-        self.tool_call_count = 0
-        self.iteration_count = 0
+        try:
 
-        result = self.graph.invoke(
-            {
-                "messages": [
-                    (
-                        "system",
-                        self.system_prompt
-                    ),
-                    (
-                        "human",
-                        question
-                    ),
-                ]
-            },
-            config={
-                # Prevent an accidental infinite agent loop
-                # from consuming the API quota.
-                "recursion_limit": 10
-            },
-        )
+            result = self.graph.invoke(
+                {
+                    "messages": [
+                        ("system", self.system_prompt),
+                        ("human", question),
+                    ]
+                },
+                config={
+                    "recursion_limit": 10
+                },
+            )
 
-        return result
+            self.status = "success"
+
+            return result
+
+        except Exception as exc:
+
+            self.status = "error"
+            self.error = str(exc)
+
+            raise
+
+        finally:
+
+            self.total_latency = (
+                time.perf_counter()
+                - request_start
+            )
 
     # =============================================================
     # Metrics
@@ -240,8 +327,34 @@ DATABASE SCHEMA:
 
     def get_metrics(self):
 
+        total_llm_latency = sum(
+            self.llm_latencies
+        )
+
+        total_tool_latency = sum(
+            latency
+            for latencies in self.tool_latencies.values()
+            for latency in latencies
+        )
+
         return {
-            "llm_calls": self.llm_call_count,
+            "request_id": self.request_id,
+            "timestamp": self.timestamp,
+            "question": self.question,
+
+            "llm_api_calls": self.llm_call_count,
             "tool_calls": self.tool_call_count,
             "iterations": self.iteration_count,
+
+            "llm_latencies": self.llm_latencies,
+            "tool_latencies": self.tool_latencies,
+
+            "total_llm_latency": total_llm_latency,
+            "total_tool_latency": total_tool_latency,
+            "total_latency": self.total_latency,
+
+            "tools_used": self.tools_used,
+
+            "status": self.status,
+            "error": self.error,
         }
