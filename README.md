@@ -2,6 +2,9 @@
 
 An experimentally evaluated AI data analyst that autonomously performs structured-data analysis using SQL and Python tools. The project investigates which agentic mechanisms—dynamic tool selection, planning, execution feedback, recovery, state, and verification—actually improve analytical reliability and at what computational cost.
 
+## Baseline
+Implement a tool-using data analysis agent using **Gemini Flash, LangGraph, and DuckDB**. The agent receives a natural-language analytical question, uses the database schema supplied as context, dynamically selects between SQL and Python analysis tools, observes tool results, and iterates until it can provide a final answer. The baseline also records the number of LLM API calls, tool calls, agent iterations and per part latency for each query.
+
 ## Experiments
 
 ### Experiment 1 — Dynamic Tool Selection
