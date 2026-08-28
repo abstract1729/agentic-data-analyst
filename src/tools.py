@@ -1,6 +1,7 @@
 from typing import Any
 
 import duckdb
+import numpy as np
 import pandas as pd
 
 
@@ -8,23 +9,31 @@ class DataAnalystTools:
     """
     Tools available to the Data Analyst Agent.
 
-    The class keeps the dataset/database interface centralized so that
-    the agent does not need to know how the underlying data is stored.
+    The class centralizes access to the underlying DuckDB database.
     """
 
     def __init__(self, database_path: str):
         self.database_path = database_path
 
+    # =============================================================
+    # Schema
+    # =============================================================
+
     def inspect_schema(self) -> str:
         """
-        Return the tables, columns, data types, and row counts
+        Return tables, columns, data types, and row counts
         available in the DuckDB database.
         """
 
-        conn = duckdb.connect(self.database_path, read_only=True)
+        conn = duckdb.connect(
+            self.database_path,
+            read_only=True,
+        )
 
         try:
-            tables = conn.execute("SHOW TABLES").fetchdf()
+            tables = conn.execute(
+                "SHOW TABLES"
+            ).fetchdf()
 
             if tables.empty:
                 return "No tables are available in the database."
@@ -32,6 +41,7 @@ class DataAnalystTools:
             output = []
 
             for table_name in tables["name"]:
+
                 schema = conn.execute(
                     f"DESCRIBE {table_name}"
                 ).fetchdf()
@@ -43,7 +53,8 @@ class DataAnalystTools:
                 output.append(
                     f"TABLE: {table_name}\n"
                     f"ROWS: {row_count}\n"
-                    f"COLUMNS:\n{schema.to_string(index=False)}"
+                    f"COLUMNS:\n"
+                    f"{schema.to_string(index=False)}"
                 )
 
             return "\n\n".join(output)
@@ -53,14 +64,19 @@ class DataAnalystTools:
 
     def get_schema_context(self) -> str:
         """
-        Return a compact schema description intended to be injected
-        into the agent's system prompt.
+        Return a compact schema description intended for
+        inclusion in the agent system prompt.
         """
 
-        conn = duckdb.connect(self.database_path, read_only=True)
+        conn = duckdb.connect(
+            self.database_path,
+            read_only=True,
+        )
 
         try:
-            tables = conn.execute("SHOW TABLES").fetchdf()
+            tables = conn.execute(
+                "SHOW TABLES"
+            ).fetchdf()
 
             if tables.empty:
                 return "No tables are available."
@@ -68,6 +84,7 @@ class DataAnalystTools:
             output = []
 
             for table_name in tables["name"]:
+
                 schema = conn.execute(
                     f"DESCRIBE {table_name}"
                 ).fetchdf()
@@ -75,12 +92,15 @@ class DataAnalystTools:
                 columns = []
 
                 for _, row in schema.iterrows():
+
                     columns.append(
-                        f"{row['column_name']} ({row['column_type']})"
+                        f"{row['column_name']} "
+                        f"({row['column_type']})"
                     )
 
                 output.append(
-                    f"{table_name}: " + ", ".join(columns)
+                    f"{table_name}: "
+                    + ", ".join(columns)
                 )
 
             return "\n".join(output)
@@ -88,14 +108,35 @@ class DataAnalystTools:
         finally:
             conn.close()
 
-    def execute_sql(self, query: str) -> str:
+    # =============================================================
+    # SQL Execution
+    # =============================================================
+
+    @staticmethod
+    def _validate_read_only_query(query: str) -> str:
         """
-        Execute a read-only SQL query against DuckDB.
+        Validate that a query is read-only.
+
+        For the baseline, only SELECT and WITH queries are allowed.
         """
 
         query = query.strip()
 
-        # Basic safety boundary for the baseline.
+        if not query:
+            raise ValueError(
+                "SQL query cannot be empty."
+            )
+
+        query_upper = query.upper()
+
+        if not (
+            query_upper.startswith("SELECT")
+            or query_upper.startswith("WITH")
+        ):
+            raise ValueError(
+                "Only SELECT or WITH queries are allowed."
+            )
+
         forbidden = [
             "INSERT",
             "UPDATE",
@@ -105,69 +146,179 @@ class DataAnalystTools:
             "CREATE",
             "TRUNCATE",
             "REPLACE",
+            "MERGE",
+            "COPY",
+            "ATTACH",
+            "DETACH",
+            "INSTALL",
+            "LOAD",
         ]
 
-        query_upper = query.upper()
+        if any(
+            keyword in query_upper
+            for keyword in forbidden
+        ):
+            raise ValueError(
+                "Only read-only SQL queries are allowed."
+            )
 
-        if any(keyword in query_upper for keyword in forbidden):
-            return "ERROR: Only read-only SQL queries are allowed."
+        return query
 
-        conn = duckdb.connect(self.database_path, read_only=True)
+    def _query_dataframe(
+        self,
+        query: str,
+    ) -> pd.DataFrame:
+        """
+        Execute a validated read-only SQL query and return
+        the result as a Pandas DataFrame.
+
+        This is the controlled database interface exposed
+        to the Python analysis environment.
+        """
+
+        query = self._validate_read_only_query(query)
+
+        conn = duckdb.connect(
+            self.database_path,
+            read_only=True,
+        )
 
         try:
-            result = conn.execute(query).fetchdf()
-
-            if result.empty:
-                return "Query executed successfully but returned no rows."
-
-            return result.to_string(index=False)
-
-        except Exception as exc:
-            return f"SQL execution error: {exc}"
+            return conn.execute(query).fetchdf()
 
         finally:
             conn.close()
 
-    def execute_python(self, code: str) -> str:
+    def execute_sql(self, query: str) -> str:
         """
-        Execute Python/Pandas analysis.
+        Execute a read-only SQL query against DuckDB.
 
-        This baseline implementation intentionally keeps the execution
-        environment constrained to a small namespace.
+        Use this tool for database-oriented operations such as:
+
+        - filtering
+        - aggregation
+        - grouping
+        - joins
+        - sorting
+        - counts
+        - sums
+        - averages
+        - temporal analysis
         """
-
-        conn = duckdb.connect(self.database_path, read_only=True)
 
         try:
-            tables = conn.execute("SHOW TABLES").fetchdf()
 
-            namespace: dict[str, Any] = {
-                "pd": pd,
-                "duckdb": duckdb,
-            }
+            result = self._query_dataframe(query)
 
-            for table_name in tables["name"]:
-                namespace[table_name] = conn.execute(
-                    f"SELECT * FROM {table_name}"
-                ).fetchdf()
+            if result.empty:
+                return (
+                    "Query executed successfully "
+                    "but returned no rows."
+                )
 
-            exec(code, {"__builtins__": {}}, namespace)
+            return result.to_string(index=False)
 
-            result = namespace.get("result")
+        except Exception as exc:
+
+            return (
+                f"SQL execution error: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    # =============================================================
+    # Python Execution
+    # =============================================================
+
+    def execute_python(self, code: str) -> str:
+        """
+        Execute Python/Pandas/NumPy analysis in a restricted
+        environment.
+
+        The Python environment does NOT contain complete database
+        tables.
+
+        Instead, the agent can use:
+
+            query("SELECT ...")
+
+        to retrieve only the data required for its analysis.
+
+        Available objects:
+
+            pd       - Pandas
+            np       - NumPy
+            query    - controlled read-only DuckDB query function
+
+        The final result must be stored in a variable named `result`.
+        """
+
+        def query(sql: str) -> pd.DataFrame:
+            """
+            Execute a read-only SQL query and return the
+            result as a Pandas DataFrame.
+            """
+
+            return self._query_dataframe(sql)
+
+        safe_builtins: dict[str, Any] = {
+            "abs": abs,
+            "all": all,
+            "any": any,
+            "float": float,
+            "int": int,
+            "len": len,
+            "list": list,
+            "max": max,
+            "min": min,
+            "range": range,
+            "round": round,
+            "set": set,
+            "sorted": sorted,
+            "sum": sum,
+            "tuple": tuple,
+            "zip": zip,
+            "enumerate": enumerate,
+        }
+
+        execution_globals: dict[str, Any] = {
+            "__builtins__": safe_builtins,
+            "pd": pd,
+            "np": np,
+            "query": query,
+        }
+
+        try:
+
+            exec(
+                code,
+                execution_globals,
+                execution_globals,
+            )
+
+            result = execution_globals.get("result")
 
             if result is None:
                 return (
                     "Python executed successfully, "
-                    "but no variable named `result` was produced."
+                    "but no variable named `result` "
+                    "was produced."
                 )
 
             if isinstance(result, pd.DataFrame):
+
+                if result.empty:
+                    return (
+                        "Python analysis completed "
+                        "but produced an empty DataFrame."
+                    )
+
                 return result.to_string(index=False)
 
             return str(result)
 
         except Exception as exc:
-            return f"Python execution error: {exc}"
 
-        finally:
-            conn.close()
+            return (
+                f"Python execution error: "
+                f"{type(exc).__name__}: {exc}"
+            )

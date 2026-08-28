@@ -198,14 +198,17 @@ DATABASE SCHEMA:
         )
 
         python_tool = StructuredTool.from_function(func=self._timed_python_tool(),name="execute_python",
-            description=("Execute Python/Pandas analysis against the "
-                "available database tables. Use this for "
-                "statistical or dataframe-oriented analysis. "
-                "The final output must be stored in a variable "
-                "named `result`."
+            description=( "Execute Python/Pandas/NumPy analysis in a restricted "
+            "environment. The environment provides pd, np, and "
+            "query(sql). Use query(sql) to retrieve only the data "
+            "required for analysis as a Pandas DataFrame. Do not "
+            "import libraries or access the database directly. "
+            "Use Python for statistical calculations, dataframe "
+            "transformations, and numerical analysis. The final "
+            "output must be stored in a variable named `result`."
             ),
         )
-        
+
         return [sql_tool,python_tool,]
 
     # =============================================================
