@@ -59,6 +59,14 @@ class DataAnalystTools:
 
             return "\n\n".join(output)
 
+        except Exception as exc:
+
+            return (
+                "SCHEMA_ERROR\n"
+                f"Error Type: {type(exc).__name__}\n"
+                f"Message: {exc}"
+            )
+
         finally:
             conn.close()
 
@@ -105,6 +113,14 @@ class DataAnalystTools:
 
             return "\n".join(output)
 
+        except Exception as exc:
+
+            return (
+                "SCHEMA_CONTEXT_ERROR\n"
+                f"Error Type: {type(exc).__name__}\n"
+                f"Message: {exc}"
+            )
+
         finally:
             conn.close()
 
@@ -119,6 +135,11 @@ class DataAnalystTools:
 
         For the baseline, only SELECT and WITH queries are allowed.
         """
+
+        if not isinstance(query, str):
+            raise TypeError(
+                "SQL query must be a string."
+            )
 
         query = query.strip()
 
@@ -212,17 +233,22 @@ class DataAnalystTools:
 
             if result.empty:
                 return (
+                    "SQL_SUCCESS\n"
                     "Query executed successfully "
                     "but returned no rows."
                 )
 
-            return result.to_string(index=False)
+            return (
+                "SQL_SUCCESS\n"
+                + result.to_string(index=False)
+            )
 
         except Exception as exc:
 
             return (
-                f"SQL execution error: "
-                f"{type(exc).__name__}: {exc}"
+                "SQL_EXECUTION_ERROR\n"
+                f"Error Type: {type(exc).__name__}\n"
+                f"Message: {exc}"
             )
 
     # =============================================================
@@ -252,10 +278,21 @@ class DataAnalystTools:
         The final result must be stored in a variable named `result`.
         """
 
+        if not isinstance(code, str):
+            return (
+                "PYTHON_EXECUTION_ERROR\n"
+                "Error Type: TypeError\n"
+                "Message: Python code must be a string."
+            )
+
         def query(sql: str) -> pd.DataFrame:
             """
             Execute a read-only SQL query and return the
             result as a Pandas DataFrame.
+
+            SQL errors are propagated to the Python execution
+            environment so they can be handled as Python-side
+            execution failures.
             """
 
             return self._query_dataframe(sql)
@@ -299,26 +336,35 @@ class DataAnalystTools:
 
             if result is None:
                 return (
-                    "Python executed successfully, "
-                    "but no variable named `result` "
-                    "was produced."
+                    "PYTHON_EXECUTION_ERROR\n"
+                    "Error Type: MissingResult\n"
+                    "Message: Python executed successfully, "
+                    "but no variable named `result` was produced."
                 )
 
             if isinstance(result, pd.DataFrame):
 
                 if result.empty:
                     return (
+                        "PYTHON_SUCCESS\n"
                         "Python analysis completed "
                         "but produced an empty DataFrame."
                     )
 
-                return result.to_string(index=False)
+                return (
+                    "PYTHON_SUCCESS\n"
+                    + result.to_string(index=False)
+                )
 
-            return str(result)
+            return (
+                "PYTHON_SUCCESS\n"
+                + str(result)
+            )
 
         except Exception as exc:
 
             return (
-                f"Python execution error: "
-                f"{type(exc).__name__}: {exc}"
+                "PYTHON_EXECUTION_ERROR\n"
+                f"Error Type: {type(exc).__name__}\n"
+                f"Message: {exc}"
             )
