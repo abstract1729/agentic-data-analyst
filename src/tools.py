@@ -1,9 +1,12 @@
+import ast
 from typing import Any
 
 import duckdb
 import numpy as np
 import pandas as pd
 
+class PythonImportNotAllowedError(Exception):
+    """Raised when Python code contains a prohibited import."""
 
 class DataAnalystTools:
     """
@@ -142,6 +145,14 @@ class DataAnalystTools:
             )
 
         query = query.strip()
+        # Qwen may occasionally return escaped newline/tab characters
+        # as literal sequences rather than actual whitespace.
+        query = (
+            query
+            .replace("\\n", "\n")
+            .replace("\\t", "\t")
+            .replace("\\r", "\r")
+        )
 
         if not query:
             raise ValueError(
@@ -255,10 +266,40 @@ class DataAnalystTools:
     # Python Execution
     # =============================================================
 
+    @staticmethod
+    def _validate_python_code(code: str) -> None:
+        """
+        Validate Python code before execution.
+
+        Import statements are explicitly prohibited because the
+        execution environment already provides the required
+        objects and intentionally disables Python imports.
+        """
+
+        try:
+            tree = ast.parse(code)
+
+        except SyntaxError:
+            # Let exec() handle the final SyntaxError reporting.
+            # This keeps the existing error format unchanged.
+            return
+
+        for node in ast.walk(tree):
+
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                raise PythonImportNotAllowedError(
+                    "Import statements are not allowed. "
+                    "Do not use `import` or `from ... import ...`. "
+                    "The following objects are already available: "
+                    "`pd`, `np`, and `query(sql)`."
+                )
+
     def execute_python(self, code: str) -> str:
         """
         Execute Python/Pandas/NumPy analysis in a restricted
         environment.
+
+        Import statements are not allowed.
 
         The Python environment does NOT contain complete database
         tables.
@@ -275,6 +316,13 @@ class DataAnalystTools:
             np       - NumPy
             query    - controlled read-only DuckDB query function
 
+        Do not use:
+
+            import pandas
+            import numpy
+            from pandas import ...
+            from numpy import ...
+
         The final result must be stored in a variable named `result`.
         """
 
@@ -284,6 +332,15 @@ class DataAnalystTools:
                 "Error Type: TypeError\n"
                 "Message: Python code must be a string."
             )
+
+        # Qwen may occasionally return escaped newline/tab
+        # characters as literal sequences.
+        code = (
+            code
+            .replace("\\n", "\n")
+            .replace("\\t", "\t")
+            .replace("\\r", "\r")
+        )
 
         def query(sql: str) -> pd.DataFrame:
             """
@@ -325,6 +382,7 @@ class DataAnalystTools:
         }
 
         try:
+            self._validate_python_code(code)
 
             exec(
                 code,

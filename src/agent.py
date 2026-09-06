@@ -5,12 +5,13 @@ from datetime import datetime, timezone
 
 from langchain_core.messages import BaseMessage, ToolMessage
 from langchain_core.tools import StructuredTool
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 
 from src.tools import DataAnalystTools
+from src.llm import QwenProvider
+from config import (build_data_analyst_prompt,SQL_TOOL_DESCRIPTION,PYTHON_TOOL_DESCRIPTION)
 
 
 class AgentState(TypedDict):
@@ -50,7 +51,7 @@ class DataAnalystAgent:
 
         self.database_path = database_path
         self.model_name = model_name
-        self.provider = "gemini"
+        self.provider = "qwen"
 
         # ---------------------------------------------------------
         # Data backend
@@ -75,61 +76,16 @@ class DataAnalystAgent:
         # LLM
         # ---------------------------------------------------------
 
-        self.llm = ChatGoogleGenerativeAI(
-            model=model_name
-        )
+        self.llm_provider = QwenProvider(model_name=model_name,base_url="http://localhost:11434",temperature=0.0)
+        self.llm = self.llm_provider.get_model()
 
-        self.llm_with_tools = self.llm.bind_tools(
-            self.tools
-        )
+        self.llm_with_tools = self.llm.bind_tools(self.tools)
 
         # ---------------------------------------------------------
         # System prompt
         # ---------------------------------------------------------
 
-        self.system_prompt = f"""
-You are an AI Data Analyst.
-
-Your job is to answer analytical questions using the
-provided dataset.
-
-Rules:
-
-1. Use the provided database schema to determine which
-   tables and columns are relevant.
-
-2. Use SQL for database-oriented analysis such as:
-   filtering, aggregation, grouping, joins, sorting,
-   and temporal analysis.
-
-3. Use Python/Pandas when statistical or dataframe
-   analysis is more appropriate.
-
-4. Do not invent numerical values.
-
-5. Base all analytical conclusions on actual tool results.
-
-6. Perform additional analysis when the available evidence
-   is insufficient.
-
-7. Clearly state when the available data cannot answer
-   the question.
-
-8. If a tool returns an execution error:
-   - inspect the error carefully,
-   - identify the cause,
-   - correct the SQL or Python code,
-   - retry the operation with a corrected query/code.
-
-9. Do not repeatedly retry the same failed operation without
-   changing the query or code.
-
-10. Provide a concise explanation of the analysis performed.
-
-DATABASE SCHEMA:
-
-{self.schema_context}
-"""
+        self.system_prompt = build_data_analyst_prompt(self.schema_context)
 
         # ---------------------------------------------------------
         # Execution metrics
@@ -154,6 +110,7 @@ DATABASE SCHEMA:
         self.tools_used = []
         self.status = None
         self.error = None
+        self._last_tool_error_type = None
 
         self.request_id = None
         self.timestamp = None
@@ -213,6 +170,7 @@ DATABASE SCHEMA:
 
         self.status = None
         self.error = None
+        self._last_tool_error_type = None
 
         # Reset error / recovery metrics.
         self.tool_error_count = 0
@@ -276,39 +234,10 @@ DATABASE SCHEMA:
     # =============================================================
 
     def _build_tools(self):
+        sql_tool = StructuredTool.from_function(func=self._timed_sql_tool(),name="execute_sql",description=SQL_TOOL_DESCRIPTION)
+        python_tool = StructuredTool.from_function(func=self._timed_python_tool(),name="execute_python",description=PYTHON_TOOL_DESCRIPTION)
 
-        sql_tool = StructuredTool.from_function(
-            func=self._timed_sql_tool(),
-            name="execute_sql",
-            description=(
-                "Execute a read-only SQL query against the "
-                "DuckDB database. Use SQL for filtering, "
-                "aggregation, grouping, joins, sorting, "
-                "and temporal analysis."
-            ),
-        )
-
-        python_tool = StructuredTool.from_function(
-            func=self._timed_python_tool(),
-            name="execute_python",
-            description=(
-                "Execute Python/Pandas/NumPy analysis in a "
-                "restricted environment. The environment "
-                "provides pd, np, and query(sql). Use query(sql) "
-                "to retrieve only the data required for analysis "
-                "as a Pandas DataFrame. Do not import libraries "
-                "or access the database directly. Use Python "
-                "for statistical calculations, dataframe "
-                "transformations, and numerical analysis. "
-                "The final output must be stored in a variable "
-                "named `result`."
-            ),
-        )
-
-        return [
-            sql_tool,
-            python_tool,
-        ]
+        return [sql_tool,python_tool]
 
     # =============================================================
     # LLM Node
@@ -319,10 +248,10 @@ DATABASE SCHEMA:
         self.llm_call_count += 1
         self.iteration_count += 1
 
-        # If the previous tool execution failed, this LLM call
-        # represents a recovery attempt.
-        if self._pending_recovery:
+        is_recovery = self._pending_recovery
+        error_type = self._last_tool_error_type
 
+        if is_recovery:
             self.recovery_attempts += 1
             self._pending_recovery = False
 
@@ -330,8 +259,40 @@ DATABASE SCHEMA:
 
         try:
 
+            messages = state["messages"]
+
+            if is_recovery:
+
+                recovery_message = (
+                    "RECOVERY INSTRUCTION: The previous tool "
+                    "execution failed.\n\n"
+                    f"Error type: {error_type}\n\n"
+                    "Inspect the previous tool result carefully. "
+                    "Identify the cause, correct the operation, "
+                    "and retry with a changed tool call.\n\n"
+                    "Do not repeat the same failed operation."
+                )
+
+                if error_type == "PythonImportNotAllowedError":
+
+                    recovery_message += (
+                        "\n\nIMPORTANT: Python imports are "
+                        "prohibited. Do NOT use `import` or "
+                        "`from ... import ...`. The Python "
+                        "environment already provides `pd`, "
+                        "`np`, and `query(sql)`."
+                    )
+
+                messages = [
+                    *messages,
+                    (
+                        "system",
+                        recovery_message,
+                    ),
+                ]
+
             response = self.llm_with_tools.invoke(
-                state["messages"]
+                messages
             )
 
             self.tool_call_count += len(
@@ -340,10 +301,8 @@ DATABASE SCHEMA:
 
             for tool_call in response.tool_calls:
 
-                tool_name = tool_call["name"]
-
                 self.tools_used.append(
-                    tool_name
+                    tool_call["name"]
                 )
 
             return {
@@ -357,9 +316,7 @@ DATABASE SCHEMA:
                 - start_time
             )
 
-            self.llm_latencies.append(
-                latency
-            )
+            self.llm_latencies.append(latency)
 
     # =============================================================
     # Tool Error Inspection
@@ -427,6 +384,7 @@ DATABASE SCHEMA:
 
                 # The next LLM call will be a recovery attempt.
                 self._pending_recovery = True
+                self._last_tool_error_type = error_type
 
             # -----------------------------------------------------
             # Detect Python execution errors
@@ -563,6 +521,121 @@ DATABASE SCHEMA:
     # =============================================================
     # Public Invocation
     # =============================================================
+ 
+    @staticmethod
+    def _print_stream_event(event_type: str,message: BaseMessage):
+
+        print(
+            f"\n[{event_type}]"
+        )
+
+        if message.type == "ai":
+
+            if message.tool_calls:
+
+                for tool_call in message.tool_calls:
+
+                    print(
+                        f"Tool call: "
+                        f"{tool_call['name']}"
+                    )
+
+                    print(
+                        f"Arguments: "
+                        f"{tool_call['args']}"
+                    )
+
+            elif message.content:
+
+                print(
+                    f"Response: "
+                    f"{message.content}"
+                )
+
+        elif message.type == "tool":
+
+            print(
+                f"Tool: "
+                f"{message.name}"
+            )
+
+            print(
+                f"Result: "
+                f"{message.content}"
+            )
+
+    def invoke_streaming(self, question: str):
+
+        self._reset_metrics()
+
+        self.question = question
+
+        request_start = time.perf_counter()
+
+        try:
+
+            initial_state = {
+                "messages": [
+                    (
+                        "system",
+                        self.system_prompt
+                    ),
+                    (
+                        "human",
+                        question
+                    ),
+                ]
+            }
+
+            final_state = None
+
+            for state in self.graph.stream(
+                initial_state,
+                config={
+                    "recursion_limit": 39
+                },
+                stream_mode="values",
+            ):
+
+                final_state = state
+
+                # The latest message tells us what just happened.
+                if not state["messages"]:
+                    continue
+
+                message = state["messages"][-1]
+
+                if message.type == "ai":
+
+                    self._print_stream_event(
+                        "LLM",
+                        message
+                    )
+
+                elif message.type == "tool":
+
+                    self._print_stream_event(
+                        "TOOL",
+                        message
+                    )
+
+            self.status = "success"
+
+            return final_state
+
+        except Exception as exc:
+
+            self.status = "error"
+            self.error = str(exc)
+
+            raise
+
+        finally:
+
+            self.total_latency = (
+                time.perf_counter()
+                - request_start
+            )
 
     def invoke(self, question: str):
 
@@ -588,7 +661,7 @@ DATABASE SCHEMA:
                     ]
                 },
                 config={
-                    "recursion_limit": 10
+                    "recursion_limit": 20
                 },
             )
 

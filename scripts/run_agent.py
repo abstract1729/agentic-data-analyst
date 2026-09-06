@@ -1,5 +1,8 @@
 import os
 import sys
+import time
+import socket
+import subprocess
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -14,108 +17,375 @@ from src.agent import DataAnalystAgent
 from utils.logger import AgentLogger
 
 
+# =============================================================
+# Configuration
+# =============================================================
+
 load_dotenv(PROJECT_ROOT / ".env")
 
-
-MODEL_NAME = "gemini-3.6-flash"
+MODEL_NAME = "qwen2.5:14b-instruct"
 DATABASE_PATH = PROJECT_ROOT / "data" / "tpch.duckdb"
 LOG_PATH = PROJECT_ROOT / "logs" / "agent_runs.jsonl"
 
+SSH_HOST = "ECESP9"
+LOCAL_OLLAMA_HOST = "127.0.0.1"
+LOCAL_OLLAMA_PORT = 11434
+REMOTE_OLLAMA_PORT = 11434
+
+
+# =============================================================
+# SSH Tunnel
+# =============================================================
+
+def is_port_open(
+    host: str,
+    port: int,
+    timeout: float = 1.0,
+) -> bool:
+    """
+    Check whether a TCP connection can be established
+    to the specified host and port.
+    """
+
+    try:
+        with socket.create_connection(
+            (host, port),
+            timeout=timeout,
+        ):
+            return True
+
+    except (ConnectionRefusedError, TimeoutError, OSError):
+        return False
+
+
+def start_ssh_tunnel():
+    """
+    Ensure that an SSH tunnel exists between:
+
+        localhost:11434
+              ↓
+        ECESP9:localhost:11434
+
+    Returns:
+
+        (process, created)
+
+    where:
+
+        process = SSH subprocess if this function created it
+                  otherwise None.
+
+        created = True if this function created the tunnel,
+                  False if an existing tunnel was reused.
+    """
+
+    # ---------------------------------------------------------
+    # Check whether an existing tunnel is already available.
+    # ---------------------------------------------------------
+
+    if is_port_open(
+        LOCAL_OLLAMA_HOST,
+        LOCAL_OLLAMA_PORT,
+    ):
+        print(
+            "Existing Ollama connection detected on "
+            f"{LOCAL_OLLAMA_HOST}:{LOCAL_OLLAMA_PORT}"
+        )
+
+        return None, False
+
+    # ---------------------------------------------------------
+    # Start SSH tunnel.
+    # ---------------------------------------------------------
+
+    print("Ollama connection not found.")
+    print("Starting SSH tunnel to ECESP9...")
+
+    command = [
+        "ssh",
+        "-N",
+        "-L",
+        (
+            f"{LOCAL_OLLAMA_PORT}:"
+            f"localhost:{REMOTE_OLLAMA_PORT}"
+        ),
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-o",
+        "ServerAliveInterval=60",
+        "-o",
+        "ServerAliveCountMax=3",
+        SSH_HOST,
+    ]
+
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    # ---------------------------------------------------------
+    # Wait for the local tunnel endpoint to become available.
+    # ---------------------------------------------------------
+
+    max_wait_seconds = 10
+
+    for _ in range(max_wait_seconds * 10):
+
+        if is_port_open(
+            LOCAL_OLLAMA_HOST,
+            LOCAL_OLLAMA_PORT,
+        ):
+            print(
+                "SSH tunnel established successfully."
+            )
+
+            return process, True
+
+        # Check whether SSH exited prematurely.
+        if process.poll() is not None:
+
+            stderr = process.stderr.read().strip()
+
+            raise RuntimeError(
+                "Failed to establish SSH tunnel to ECESP9.\n"
+                f"SSH error: {stderr}"
+            )
+
+        time.sleep(0.1)
+
+    # ---------------------------------------------------------
+    # Tunnel did not become available in time.
+    # ---------------------------------------------------------
+
+    process.terminate()
+
+    try:
+        process.wait(timeout=2)
+
+    except subprocess.TimeoutExpired:
+        process.kill()
+
+    raise RuntimeError(
+        "SSH tunnel could not be established within "
+        f"{max_wait_seconds} seconds."
+    )
+
+
+def stop_ssh_tunnel(
+    process: subprocess.Popen | None,
+):
+    """
+    Stop the SSH tunnel only if this application created it.
+
+    Existing tunnels are intentionally left untouched.
+    """
+
+    if process is None:
+        return
+
+    if process.poll() is None:
+
+        print("\nStopping SSH tunnel...")
+
+        process.terminate()
+
+        try:
+            process.wait(timeout=3)
+
+        except subprocess.TimeoutExpired:
+
+            process.kill()
+            process.wait()
+
+        print("SSH tunnel stopped.")
+
+
+def verify_ollama():
+    """
+    Verify that Ollama is reachable through the local tunnel.
+
+    This uses the Ollama HTTP API directly rather than
+    making an LLM call.
+    """
+
+    import urllib.request
+    import urllib.error
+
+    url = (
+        f"http://{LOCAL_OLLAMA_HOST}:"
+        f"{LOCAL_OLLAMA_PORT}/api/tags"
+    )
+
+    try:
+
+        with urllib.request.urlopen(
+            url,
+            timeout=5,
+        ) as response:
+
+            if response.status != 200:
+                raise RuntimeError(
+                    f"Ollama returned HTTP {response.status}."
+                )
+
+    except urllib.error.URLError as exc:
+
+        raise RuntimeError(
+            "Ollama is not reachable through the SSH tunnel.\n"
+            f"Endpoint: {url}\n"
+            f"Error: {exc}"
+        ) from exc
+
+    print("Ollama connection verified.")
+
+
+# =============================================================
+# Main
+# =============================================================
 
 def main():
 
-    if not os.getenv("GEMINI_API_KEY"):
-        raise RuntimeError(
-            "GEMINI_API_KEY is not set. "
-            "Add it to the .env file."
+    tunnel_process = None
+
+    try:
+
+        # -----------------------------------------------------
+        # Establish / reuse SSH tunnel
+        # -----------------------------------------------------
+
+        tunnel_process, tunnel_created = start_ssh_tunnel()
+
+        # -----------------------------------------------------
+        # Verify Ollama
+        # -----------------------------------------------------
+
+        verify_ollama()
+
+        # -----------------------------------------------------
+        # Create agent
+        # -----------------------------------------------------
+
+        agent = DataAnalystAgent(
+            database_path=str(DATABASE_PATH),
+            model_name=MODEL_NAME,
         )
 
-    agent = DataAnalystAgent(
-        database_path=str(DATABASE_PATH),
-        model_name=MODEL_NAME,
-    )
+        logger = AgentLogger(LOG_PATH)
 
-    logger = AgentLogger(LOG_PATH)
-
-    print("Data Analyst Agent")
-    print("=" * 50)
-
-    while True:
-
-        question = input("\nQuestion: ").strip()
-
-        if question.lower() in {"exit", "quit"}:
-            break
-
-        if not question:
-            continue
-
-        try:
-
-            result = agent.invoke(question)
-
-        except Exception as exc:
-
-            print("\nAgent execution failed:")
-            print(exc)
-
-            # Log failed request as well.
-            metrics = agent.get_metrics()
-            logger.log_run(metrics)
-
-            continue
-
-        # ---------------------------------------------------------
-        # Agent trace
-        # ---------------------------------------------------------
-
-        print("\n" + "=" * 50)
-        print("AGENT TRACE")
+        print("\nData Analyst Agent")
         print("=" * 50)
+        print(f"Provider: qwen")
+        print(f"Model: {MODEL_NAME}")
+        print(f"Ollama: http://{LOCAL_OLLAMA_HOST}:{LOCAL_OLLAMA_PORT}")
 
-        for message in result["messages"]:
+        # -----------------------------------------------------
+        # Interactive loop
+        # -----------------------------------------------------
 
-            print(f"\n[{message.type.upper()}]")
+        while True:
 
-            if message.type == "human":
+            question = input("\nQuestion: ").strip()
 
-                print(message.content)
+            if question.lower() in {"exit", "quit"}:
+                break
 
-            elif message.type == "ai":
+            if not question:
+                continue
 
-                if message.tool_calls:
+            try:
 
-                    for tool_call in message.tool_calls:
+                result = agent.invoke_streaming(question)
 
-                        print(
-                            f"Tool call: {tool_call['name']}"
-                        )
+            except Exception as exc:
 
-                        print(
-                            f"Arguments: {tool_call['args']}"
-                        )
+                print("\nAgent execution failed:")
+                print(exc)
 
-                elif message.content:
+                # Log failed request as well.
+                metrics = agent.get_metrics()
+                logger.log_run(metrics)
+
+                continue
+
+            # -------------------------------------------------
+            # Agent trace
+            # -------------------------------------------------
+
+            print("\n" + "=" * 50)
+            print("AGENT TRACE")
+            print("=" * 50)
+
+            for message in result["messages"]:
+
+                print(
+                    f"\n[{message.type.upper()}]"
+                )
+
+                if message.type == "human":
 
                     print(message.content)
 
-            elif message.type == "tool":
+                elif message.type == "ai":
 
-                print(f"Tool: {message.name}")
-                print(message.content)
+                    if message.tool_calls:
 
-        # ---------------------------------------------------------
-        # Persistent logging
-        # ---------------------------------------------------------
+                        for tool_call in message.tool_calls:
 
-        metrics = agent.get_metrics()
+                            print(
+                                f"Tool call: "
+                                f"{tool_call['name']}"
+                            )
 
-        logger.log_run(metrics)
+                            print(
+                                f"Arguments: "
+                                f"{tool_call['args']}"
+                            )
 
-        print("\nExecution metrics logged.")
+                    elif message.content:
 
-        print("=" * 50)
+                        print(message.content)
 
+                elif message.type == "tool":
+
+                    print(f"Tool: {message.name}")
+                    print(message.content)
+
+            # -------------------------------------------------
+            # Persistent logging
+            # -------------------------------------------------
+
+            metrics = agent.get_metrics()
+
+            logger.log_run(metrics)
+
+            print("\nExecution metrics logged.")
+            print("=" * 50)
+
+    except KeyboardInterrupt:
+
+        print("\n\nApplication interrupted by user.")
+
+    except Exception as exc:
+
+        print("\nApplication startup failed:")
+        print(exc)
+
+        raise
+
+    finally:
+
+        # -----------------------------------------------------
+        # Clean up only the tunnel created by this process.
+        # -----------------------------------------------------
+
+        stop_ssh_tunnel(tunnel_process)
+
+
+# =============================================================
+# Entry Point
+# =============================================================
 
 if __name__ == "__main__":
     main()

@@ -176,3 +176,11 @@ results/*
 # =========================
 logs/*
 !logs/.gitkeep
+
+
+.env
+*.gguf
+*.safetensors
+*.bin
+models/
+.ollama/
