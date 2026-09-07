@@ -2,6 +2,7 @@ from typing import Annotated, TypedDict
 import time
 import uuid
 from datetime import datetime, timezone
+from pydantic import BaseModel, Field
 
 from langchain_core.messages import BaseMessage, ToolMessage
 from langchain_core.tools import StructuredTool
@@ -10,10 +11,10 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 
 from src.tools import DataAnalystTools
-from src.llm import QwenProvider
+from src.llm import LLMProvider
 from src.reviewer import ReviewerAgent, ReviewResult
 from config import (build_data_analyst_prompt,SQL_TOOL_DESCRIPTION,PYTHON_TOOL_DESCRIPTION)
-from pydantic import BaseModel, Field
+from config import (FULL_DATABASE_SEMANTICS, ANALYST_SEMANTICS)
 
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
@@ -53,19 +54,29 @@ class DataAnalystAgent:
     not an agent tool in the baseline.
     """
 
-    def __init__(self, database_path: str, model_name: str):
-
+    def __init__(self,llm_provider: LLMProvider,database_path: str,model_name: str):
         self.database_path = database_path
         self.model_name = model_name
-        self.provider = "qwen"
+
+        # Provider metadata
+        self.provider = (
+            llm_provider.__class__.__name__
+            .replace("Provider", "")
+            .lower()
+        )
 
         # ---------------------------------------------------------
         # Data backend
         # ---------------------------------------------------------
 
-        self.tools_backend = DataAnalystTools(database_path=database_path)
+        self.tools_backend = DataAnalystTools(
+            database_path=database_path
+        )
+
         # Load schema once.
-        self.schema_context = (self.tools_backend.get_schema_context())
+        self.schema_context = (
+            self.tools_backend.get_schema_context()
+        )
 
         # ---------------------------------------------------------
         # Tools
@@ -77,7 +88,7 @@ class DataAnalystAgent:
         # LLM
         # ---------------------------------------------------------
 
-        self.llm_provider = QwenProvider(model_name=model_name,base_url="http://localhost:11434",temperature=0.0)
+        self.llm_provider = llm_provider
         self.llm = self.llm_provider.get_model()
 
         self.llm_with_tools = self.llm.bind_tools(self.tools)
@@ -86,7 +97,10 @@ class DataAnalystAgent:
         # Reviewer
         # ---------------------------------------------------------
 
-        self.reviewer = ReviewerAgent(model_name=model_name,base_url="http://localhost:11434",temperature=0.0,)
+        self.reviewer = ReviewerAgent(
+            llm_provider=llm_provider
+        )
+
         # Maximum number of Analyst retries after the original
         # Analyst attempt.
         self.max_analyst_retries = 2
@@ -95,7 +109,10 @@ class DataAnalystAgent:
         # System prompt
         # ---------------------------------------------------------
 
-        self.system_prompt = build_data_analyst_prompt(self.schema_context)
+        self.system_prompt = build_data_analyst_prompt(
+            self.schema_context,
+            ANALYST_SEMANTICS,
+        )
 
         # ---------------------------------------------------------
         # Execution metrics
@@ -478,7 +495,7 @@ class DataAnalystAgent:
         review_result = self.reviewer.review(
             question=analysis_package["question"],
             schema_context=analysis_package["schema"],
-            semantics_context="",
+            semantics_context=FULL_DATABASE_SEMANTICS,
             analysis_trace=str(
                 {
                     "tool_calls": analysis_package["tool_calls"],

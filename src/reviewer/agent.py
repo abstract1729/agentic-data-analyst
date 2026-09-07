@@ -1,6 +1,6 @@
 from typing import Any
 
-from src.llm import QwenProvider
+from src.llm import LLMProvider
 from config import REVIEWER_SYSTEM_PROMPT
 
 from .schemas import ReviewResult
@@ -16,27 +16,21 @@ class ReviewerAgent:
     answer against the user's question and database semantics.
     """
 
-    def __init__(
-        self,
-        model_name: str,
-        base_url: str = "http://localhost:11434",
-        temperature: float = 0.0,
-    ):
-        self.model_name = model_name
-        self.provider = "qwen"
+    def __init__(self, llm_provider: LLMProvider):
 
-        self.llm_provider = QwenProvider(
-            model_name=model_name,
-            base_url=base_url,
-            temperature=temperature,
+        self.llm_provider = llm_provider
+
+        # Provider metadata
+        self.provider = (
+            llm_provider.__class__.__name__
+            .replace("Provider", "")
+            .lower()
         )
 
         self.llm = self.llm_provider.get_model()
 
-        self.reviewer_llm = (
-            self.llm.with_structured_output(
-                ReviewResult
-            )
+        self.reviewer_llm = self.llm.with_structured_output(
+            ReviewResult
         )
 
     # =============================================================

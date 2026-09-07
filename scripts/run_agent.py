@@ -14,6 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.agent import DataAnalystAgent
+from src.llm import QwenProvider, GeminiProvider
 from utils.logger import AgentLogger
 
 
@@ -23,7 +24,11 @@ from utils.logger import AgentLogger
 
 load_dotenv(PROJECT_ROOT / ".env")
 
-MODEL_NAME = "qwen2.5:14b-instruct"
+PROVIDER = "gemini"
+
+QWEN_MODEL_NAME = "qwen2.5:14b-instruct"
+GEMINI_MODEL_NAME = "gemini-3.6-flash"
+
 DATABASE_PATH = PROJECT_ROOT / "data" / "tpch.duckdb"
 LOG_PATH = PROJECT_ROOT / "logs" / "agent_runs.jsonl"
 
@@ -32,16 +37,42 @@ LOCAL_OLLAMA_HOST = "127.0.0.1"
 LOCAL_OLLAMA_PORT = 11434
 REMOTE_OLLAMA_PORT = 11434
 
+# =============================================================
+# Provider Selection
+# =============================================================
+def create_llm_provider():
+    """
+    Create the configured LLM provider.
+
+    Qwen uses the local Ollama endpoint.
+    Gemini uses the Gemini API through its environment-based
+    authentication.
+    """
+
+    if PROVIDER == "qwen":
+
+        return QwenProvider(
+            model_name=QWEN_MODEL_NAME,
+            base_url="http://localhost:11434",
+            temperature=0.0,
+        )
+
+    if PROVIDER == "gemini":
+
+        return GeminiProvider(
+            model_name=GEMINI_MODEL_NAME,
+            temperature=0.0,
+        )
+
+    raise ValueError(
+        f"Unsupported LLM provider: {PROVIDER}"
+    )
 
 # =============================================================
 # SSH Tunnel
 # =============================================================
 
-def is_port_open(
-    host: str,
-    port: int,
-    timeout: float = 1.0,
-) -> bool:
+def is_port_open(host: str,port: int,timeout: float = 1.0,) -> bool:
     """
     Check whether a TCP connection can be established
     to the specified host and port.
@@ -246,39 +277,47 @@ def verify_ollama():
 # =============================================================
 
 def main():
-
     tunnel_process = None
 
     try:
 
         # -----------------------------------------------------
-        # Establish / reuse SSH tunnel
+        # Establish / reuse provider-specific connection
         # -----------------------------------------------------
 
-        tunnel_process, tunnel_created = start_ssh_tunnel()
+        if PROVIDER == "qwen":
+            tunnel_process, tunnel_created = start_ssh_tunnel()
+            verify_ollama()
 
-        # -----------------------------------------------------
-        # Verify Ollama
-        # -----------------------------------------------------
+        elif PROVIDER == "gemini":
+            print("Using Gemini API.")
 
-        verify_ollama()
+        else:
+            raise ValueError(f"Unsupported LLM provider: {PROVIDER}")
 
         # -----------------------------------------------------
         # Create agent
         # -----------------------------------------------------
 
-        agent = DataAnalystAgent(
-            database_path=str(DATABASE_PATH),
-            model_name=MODEL_NAME,
-        )
+        llm_provider = create_llm_provider()
+        model_name = ( QWEN_MODEL_NAME if PROVIDER == "qwen" else GEMINI_MODEL_NAME )
+        agent = DataAnalystAgent(llm_provider=llm_provider,database_path=str(DATABASE_PATH),model_name=model_name,)
 
         logger = AgentLogger(LOG_PATH)
 
         print("\nData Analyst Agent")
         print("=" * 50)
-        print(f"Provider: qwen")
-        print(f"Model: {MODEL_NAME}")
-        print(f"Ollama: http://{LOCAL_OLLAMA_HOST}:{LOCAL_OLLAMA_PORT}")
+        print(f"Provider: {PROVIDER}")
+        print(f"Model: {model_name}")
+
+        if PROVIDER == "qwen":
+            print(
+                f"Ollama: "
+                f"http://{LOCAL_OLLAMA_HOST}:{LOCAL_OLLAMA_PORT}"
+            )
+
+        elif PROVIDER == "gemini":
+            print("Gemini API: configured")
 
         # -----------------------------------------------------
         # Interactive loop
