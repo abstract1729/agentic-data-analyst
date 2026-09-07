@@ -66,8 +66,14 @@ class AgentRunRecord:
     )
 
     recovery_attempts: int = 0
-
     recovered: bool = False
+
+    # ---------------------------------------------------------
+    # Reviewer / multi-agent execution
+    # ---------------------------------------------------------
+
+    analyst_retry_count: int = 0
+    review: dict[str, Any] | None = None
 
     # ---------------------------------------------------------
     # Serialization
@@ -106,4 +112,7 @@ class AgentRunRecord:
             "errors": self.errors,
             "recovery_attempts": self.recovery_attempts,
             "recovered": self.recovered,
+
+            "analyst_retry_count": self.analyst_retry_count,
+            "review": self.review,
         }

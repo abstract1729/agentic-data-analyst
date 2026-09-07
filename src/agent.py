@@ -11,12 +11,18 @@ from langgraph.prebuilt import ToolNode, tools_condition
 
 from src.tools import DataAnalystTools
 from src.llm import QwenProvider
+from src.reviewer import ReviewerAgent, ReviewResult
 from config import (build_data_analyst_prompt,SQL_TOOL_DESCRIPTION,PYTHON_TOOL_DESCRIPTION)
-
+from pydantic import BaseModel, Field
 
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
+    review_result: ReviewResult | None
+    analyst_retry_count: int
 
+class SQLToolInput(BaseModel):
+    query: str | None = Field(default=None,description="SQL query to execute.")
+    sql: str | None = Field(default=None,description="Alternative name for the SQL query.")
 
 class DataAnalystAgent:
     """
@@ -57,14 +63,9 @@ class DataAnalystAgent:
         # Data backend
         # ---------------------------------------------------------
 
-        self.tools_backend = DataAnalystTools(
-            database_path=database_path
-        )
-
+        self.tools_backend = DataAnalystTools(database_path=database_path)
         # Load schema once.
-        self.schema_context = (
-            self.tools_backend.get_schema_context()
-        )
+        self.schema_context = (self.tools_backend.get_schema_context())
 
         # ---------------------------------------------------------
         # Tools
@@ -80,6 +81,15 @@ class DataAnalystAgent:
         self.llm = self.llm_provider.get_model()
 
         self.llm_with_tools = self.llm.bind_tools(self.tools)
+
+        # ---------------------------------------------------------
+        # Reviewer
+        # ---------------------------------------------------------
+
+        self.reviewer = ReviewerAgent(model_name=model_name,base_url="http://localhost:11434",temperature=0.0,)
+        # Maximum number of Analyst retries after the original
+        # Analyst attempt.
+        self.max_analyst_retries = 2
 
         # ---------------------------------------------------------
         # System prompt
@@ -115,6 +125,7 @@ class DataAnalystAgent:
         self.request_id = None
         self.timestamp = None
         self.question = None
+        self.analysis_package = None
 
         # ---------------------------------------------------------
         # Error / recovery metrics
@@ -138,6 +149,9 @@ class DataAnalystAgent:
         self._pending_recovery = False
         self._inspected_tool_messages = 0
 
+        self.analyst_retry_count = 0
+        self.review_result = None
+
         # ---------------------------------------------------------
         # Graph
         # ---------------------------------------------------------
@@ -149,12 +163,8 @@ class DataAnalystAgent:
     # =============================================================
 
     def _reset_metrics(self):
-
         self.request_id = str(uuid.uuid4())
-
-        self.timestamp = (
-            datetime.now(timezone.utc).isoformat()
-        )
+        self.timestamp = (datetime.now(timezone.utc).isoformat())
 
         self.llm_call_count = 0
         self.tool_call_count = 0
@@ -167,6 +177,8 @@ class DataAnalystAgent:
 
         self.total_latency = 0.0
         self._inspected_tool_messages = 0
+        self.analyst_retry_count = 0
+        self.review_result = None
 
         self.status = None
         self.error = None
@@ -178,31 +190,30 @@ class DataAnalystAgent:
         self.recovery_attempts = 0
         self.recovered = False
         self._pending_recovery = False
+        self.analysis_package = None
 
     # =============================================================
     # Timed Tools
     # =============================================================
 
     def _timed_sql_tool(self):
-
-        def execute_sql_timed(query: str) -> str:
+        def execute_sql_timed(query: str | None = None,sql: str | None = None,) -> str:
+            actual_query = query or sql
+            if not actual_query:
+                return (
+                    "SQL_EXECUTION_ERROR\n"
+                    "Error Type: MissingQuery\n"
+                    "Message: No SQL query was provided."
+                )
 
             start_time = time.perf_counter()
 
             try:
-                return self.tools_backend.execute_sql(query)
+                return self.tools_backend.execute_sql(actual_query)
 
             finally:
-
-                latency = (
-                    time.perf_counter()
-                    - start_time
-                )
-
-                self.tool_latencies.setdefault(
-                    "execute_sql",
-                    []
-                ).append(latency)
+                latency = (time.perf_counter()- start_time)
+                self.tool_latencies.setdefault("execute_sql",[]).append(latency)
 
         return execute_sql_timed
 
@@ -404,6 +415,7 @@ class DataAnalystAgent:
 
                 # The next LLM call will be a recovery attempt.
                 self._pending_recovery = True
+                self._last_tool_error_type = error_type
 
             # -----------------------------------------------------
             # Detect successful execution after recovery
@@ -446,6 +458,159 @@ class DataAnalystAgent:
         return "Unknown"
 
     # =============================================================
+    # Reviewer Node
+    # =============================================================
+
+    def _review_analysis(self, state: AgentState):
+        """
+        Review the completed Analyst analysis.
+
+        The Reviewer receives:
+            - user question
+            - database schema
+            - database semantics
+            - Analyst tool calls/results
+            - final Analyst answer
+        """
+
+        analysis_package = self.get_analysis_package(state)
+
+        review_result = self.reviewer.review(
+            question=analysis_package["question"],
+            schema_context=analysis_package["schema"],
+            semantics_context="",
+            analysis_trace=str(
+                {
+                    "tool_calls": analysis_package["tool_calls"],
+                    "tool_results": analysis_package["tool_results"],
+                }
+            ),
+            final_answer=analysis_package["final_answer"],
+        )
+
+        self.review_result = review_result
+
+        print("\n[REVIEWER]")
+        print(f"Status: {review_result.status}")
+        print(f"Confidence: {review_result.confidence}")
+
+        if review_result.issues:
+
+            print("Issues:")
+
+            for issue in review_result.issues:
+
+                print(
+                    f"  - [{issue.type}] "
+                    f"{issue.description}"
+                )
+
+        else:
+
+            print("Issues: None")
+
+        if review_result.correction:
+
+            print("Correction:")
+            print(review_result.correction)
+
+
+        return {
+            "review_result": review_result
+        }
+
+    # =============================================================
+    # Reviewer Routing
+    # =============================================================
+
+    def _prepare_analyst_retry(self, state: AgentState):
+
+        retry_count = state["analyst_retry_count"] + 1
+
+        print(
+            f"\n[ANALYST RETRY] "
+            f"Starting retry {retry_count}/"
+            f"{self.max_analyst_retries}"
+        )
+
+        # Keep the object-level metric synchronized with the LangGraph state.
+        self.analyst_retry_count = retry_count
+        review_result = state.get("review_result")
+
+        correction = ""
+
+        if review_result is not None:
+            correction = review_result.correction
+
+        retry_message = (
+            "REVIEWER FEEDBACK: The previous analysis was rejected.\n\n"
+            f"Correction required:\n{correction}\n\n"
+            "Re-evaluate the original user question and correct "
+            "the analysis. Do not blindly repeat the previous "
+            "approach."
+        )
+
+        return {
+            "messages": [
+                (
+                    "system",
+                    retry_message,
+                )
+            ],
+            "analyst_retry_count": retry_count,
+            "review_result": None,
+        }
+
+
+    def _route_after_review(self, state: AgentState):
+
+        review_result = state.get("review_result")
+        retry_count = state["analyst_retry_count"]
+
+        print("\n[REVIEWER ROUTER]")
+
+        if review_result is None:
+
+            print("Reviewer result: None")
+            print("Decision: END")
+
+            return END
+
+        print(f"Reviewer status: {review_result.status}")
+        print(f"Analyst retry count: {retry_count}")
+        print(
+            f"Maximum Analyst retries: "
+            f"{self.max_analyst_retries}"
+        )
+
+        # ---------------------------------------------------------
+        # Reviewer accepted the Analyst result
+        # ---------------------------------------------------------
+
+        if review_result.status == "PASS":
+
+            print("Decision: PASS → END")
+
+            return END
+
+        # ---------------------------------------------------------
+        # Reviewer rejected the Analyst result
+        # ---------------------------------------------------------
+
+        if retry_count >= self.max_analyst_retries:
+
+            print(
+                "Decision: FAIL + retry limit reached → END"
+            )
+
+            return END
+
+        print("Decision: FAIL → ANALYST RETRY")
+
+        return "analyst_retry"
+    
+    
+    # =============================================================
     # Graph
     # =============================================================
 
@@ -476,8 +641,18 @@ class DataAnalystAgent:
             self._inspect_tool_results
         )
 
+        graph.add_node(
+            "reviewer",
+            self._review_analysis
+        )
+
+        graph.add_node(
+            "analyst_retry",
+            self._prepare_analyst_retry
+        )
+
         # ---------------------------------------------------------
-        # Start → LLM
+        # START → Analyst
         # ---------------------------------------------------------
 
         graph.add_edge(
@@ -486,7 +661,7 @@ class DataAnalystAgent:
         )
 
         # ---------------------------------------------------------
-        # LLM → Tool / END
+        # Analyst → Tools / Reviewer
         # ---------------------------------------------------------
 
         graph.add_conditional_edges(
@@ -494,12 +669,12 @@ class DataAnalystAgent:
             tools_condition,
             {
                 "tools": "tools",
-                END: END,
+                END: "reviewer",
             },
         )
 
         # ---------------------------------------------------------
-        # Tool → Error Inspection
+        # Tools → Error Inspection
         # ---------------------------------------------------------
 
         graph.add_edge(
@@ -508,7 +683,7 @@ class DataAnalystAgent:
         )
 
         # ---------------------------------------------------------
-        # Error Inspection → LLM
+        # Error Inspection → Analyst
         # ---------------------------------------------------------
 
         graph.add_edge(
@@ -516,7 +691,100 @@ class DataAnalystAgent:
             "agent"
         )
 
+        # ---------------------------------------------------------
+        # Reviewer → END / Analyst Retry
+        # ---------------------------------------------------------
+
+        graph.add_conditional_edges(
+            "reviewer",
+            self._route_after_review,
+            {
+                END: END,
+                "analyst_retry": "analyst_retry",
+            },
+        )
+
+        # ---------------------------------------------------------
+        # Analyst Retry → Analyst
+        # ---------------------------------------------------------
+
+        graph.add_edge(
+            "analyst_retry",
+            "agent"
+        )
+
         return graph.compile()
+
+    # =============================================================
+    # Analysis Package
+    # =============================================================
+
+    def get_analysis_package(self, final_state: AgentState) -> dict:
+        """
+        Build a structured package containing everything required
+        by the Reviewer Agent.
+
+        The package contains:
+            - original user question
+            - database schema
+            - Analyst tool calls
+            - tool execution results
+            - final Analyst response
+        """
+
+        messages = final_state["messages"]
+
+        tool_calls = []
+        tool_results = []
+        final_answer = ""
+
+        for message in messages:
+
+            # -----------------------------------------------------
+            # Analyst tool calls
+            # -----------------------------------------------------
+
+            if message.type == "ai" and message.tool_calls:
+
+                for tool_call in message.tool_calls:
+
+                    tool_calls.append(
+                        {
+                            "tool_name": tool_call["name"],
+                            "arguments": tool_call["args"],
+                            "tool_call_id": tool_call["id"],
+                        }
+                    )
+
+            # -----------------------------------------------------
+            # Tool execution results
+            # -----------------------------------------------------
+
+            elif isinstance(message, ToolMessage):
+
+                tool_results.append(
+                    {
+                        "tool_name": message.name,
+                        "tool_call_id": message.tool_call_id,
+                        "result": message.content,
+                    }
+                )
+
+            # -----------------------------------------------------
+            # Final Analyst response
+            # -----------------------------------------------------
+
+            elif message.type == "ai" and message.content:
+
+                final_answer = message.content
+
+        return {
+            "question": self.question,
+            "schema": self.schema_context,
+            "tool_calls": tool_calls,
+            "tool_results": tool_results,
+            "final_answer": final_answer,
+        }
 
     # =============================================================
     # Public Invocation
@@ -566,76 +834,66 @@ class DataAnalystAgent:
 
     def invoke_streaming(self, question: str):
 
+        self.question = question
         self._reset_metrics()
 
-        self.question = question
+        initial_state: AgentState = {
+            "messages": [
+                ("system", self.system_prompt),
+                ("human", question),
+            ],
+            "review_result": None,
+            "analyst_retry_count": 0,
+        }
 
-        request_start = time.perf_counter()
+        final_state = None
+        last_message_key = None
 
-        try:
+        for state in self.graph.stream(
+            initial_state,
+            config={"recursion_limit": 39},
+            stream_mode="values",
+        ):
+            final_state = state
 
-            initial_state = {
-                "messages": [
-                    (
-                        "system",
-                        self.system_prompt
-                    ),
-                    (
-                        "human",
-                        question
-                    ),
-                ]
-            }
+            if not state["messages"]:
+                continue
 
-            final_state = None
+            message = state["messages"][-1]
 
-            for state in self.graph.stream(
-                initial_state,
-                config={
-                    "recursion_limit": 39
-                },
-                stream_mode="values",
-            ):
+            # `stream_mode="values"` can emit the same message again
+            # when another part of the state changes, such as when
+            # the Reviewer produces `review_result`.
+            #
+            # Use the message ID when available. Otherwise, fall back
+            # to the message contents.
+            message_key = getattr(message, "id", None)
 
-                final_state = state
+            if message_key is None:
+                message_key = (
+                    message.type,
+                    getattr(message, "name", None),
+                    str(message.content),
+                )
 
-                # The latest message tells us what just happened.
-                if not state["messages"]:
-                    continue
+            if message_key == last_message_key:
+                continue
 
-                message = state["messages"][-1]
+            last_message_key = message_key
 
-                if message.type == "ai":
+            if message.type == "ai":
+                self._print_stream_event("LLM", message)
 
-                    self._print_stream_event(
-                        "LLM",
-                        message
-                    )
+            elif message.type == "tool":
+                self._print_stream_event("TOOL", message)
 
-                elif message.type == "tool":
+        if final_state is None:
+            raise RuntimeError("Agent graph produced no final state.")
 
-                    self._print_stream_event(
-                        "TOOL",
-                        message
-                    )
+        self.analysis_package = self.get_analysis_package(final_state)
+        self.status = "success"
 
-            self.status = "success"
-
-            return final_state
-
-        except Exception as exc:
-
-            self.status = "error"
-            self.error = str(exc)
-
-            raise
-
-        finally:
-
-            self.total_latency = (
-                time.perf_counter()
-                - request_start
-            )
+        return final_state
 
     def invoke(self, question: str):
 
@@ -658,13 +916,16 @@ class DataAnalystAgent:
                             "human",
                             question
                         ),
-                    ]
+                    ],
+                    "review_result": None,
+                    "analyst_retry_count": 0,
                 },
                 config={
-                    "recursion_limit": 20
+                    "recursion_limit": 39
                 },
             )
 
+            self.analysis_package = self.get_analysis_package(result)
             self.status = "success"
 
             return result
@@ -752,4 +1013,12 @@ class DataAnalystAgent:
             "errors": self.errors,
             "recovery_attempts": self.recovery_attempts,
             "recovered": self.recovered,
+
+            "analyst_retry_count": self.analyst_retry_count,
+
+            "review": (
+                self.review_result.model_dump()
+                if self.review_result is not None
+                else None
+            ),
         }

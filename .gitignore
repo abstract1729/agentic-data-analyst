@@ -184,3 +184,4 @@ logs/*
 *.bin
 models/
 .ollama/
+scripts/test_qwen_chat_ollama.py
