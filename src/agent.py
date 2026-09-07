@@ -15,6 +15,7 @@ from src.llm import LLMProvider
 from src.reviewer import ReviewerAgent, ReviewResult
 from config import (build_data_analyst_prompt,SQL_TOOL_DESCRIPTION,PYTHON_TOOL_DESCRIPTION)
 from config import (FULL_DATABASE_SEMANTICS, ANALYST_SEMANTICS)
+from src.guardrails import validate_user_input
 
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
@@ -57,26 +58,16 @@ class DataAnalystAgent:
     def __init__(self,llm_provider: LLMProvider,database_path: str,model_name: str):
         self.database_path = database_path
         self.model_name = model_name
-
         # Provider metadata
-        self.provider = (
-            llm_provider.__class__.__name__
-            .replace("Provider", "")
-            .lower()
-        )
+        self.provider = (llm_provider.__class__.__name__.replace("Provider", "").lower())
 
         # ---------------------------------------------------------
         # Data backend
         # ---------------------------------------------------------
 
-        self.tools_backend = DataAnalystTools(
-            database_path=database_path
-        )
-
+        self.tools_backend = DataAnalystTools(database_path=database_path)
         # Load schema once.
-        self.schema_context = (
-            self.tools_backend.get_schema_context()
-        )
+        self.schema_context = (self.tools_backend.get_schema_context())
 
         # ---------------------------------------------------------
         # Tools
@@ -137,6 +128,12 @@ class DataAnalystAgent:
         self.tools_used = []
         self.status = None
         self.error = None
+
+        # Guardrail Metrics
+        self.guardrail_triggered = False
+        self.guardrail_type = None
+        self.guardrail_reason = None
+
         self._last_tool_error_type = None
 
         self.request_id = None
@@ -201,6 +198,10 @@ class DataAnalystAgent:
         self.error = None
         self._last_tool_error_type = None
 
+        self.guardrail_triggered = False
+        self.guardrail_type = None
+        self.guardrail_reason = None
+
         # Reset error / recovery metrics.
         self.tool_error_count = 0
         self.errors = []
@@ -209,6 +210,27 @@ class DataAnalystAgent:
         self._pending_recovery = False
         self.analysis_package = None
 
+    def _validate_user_input(self, question: str) -> None:
+        """
+        Validate the user question before entering the agent graph.
+        """
+
+        result = validate_user_input(question)
+
+        if not result.allowed:
+
+            self.guardrail_triggered = True
+            self.guardrail_type = result.guardrail_type
+            self.guardrail_reason = result.reason
+
+            self.status = "blocked"
+            self.error = result.reason
+
+            raise ValueError(
+                f"Input guardrail blocked the request: "
+                f"{result.reason}"
+            )
+        
     # =============================================================
     # Timed Tools
     # =============================================================
@@ -851,8 +873,9 @@ class DataAnalystAgent:
 
     def invoke_streaming(self, question: str):
 
-        self.question = question
         self._reset_metrics()
+        self.question = question
+        self._validate_user_input(question)
 
         initial_state: AgentState = {
             "messages": [
@@ -922,6 +945,8 @@ class DataAnalystAgent:
 
         try:
 
+            self._validate_user_input(question)
+
             result = self.graph.invoke(
                 {
                     "messages": [
@@ -949,7 +974,10 @@ class DataAnalystAgent:
 
         except Exception as exc:
 
-            self.status = "error"
+            # Preserve "blocked" status set by the guardrail.
+            if self.status != "blocked":
+                self.status = "error"
+
             self.error = str(exc)
 
             raise
@@ -966,16 +994,8 @@ class DataAnalystAgent:
     # =============================================================
 
     def get_metrics(self):
-
-        total_llm_latency = sum(
-            self.llm_latencies
-        )
-
-        total_tool_latency = sum(
-            latency
-            for latencies in self.tool_latencies.values()
-            for latency in latencies
-        )
+        total_llm_latency = sum(self.llm_latencies)
+        total_tool_latency = sum(latency for latencies in self.tool_latencies.values() for latency in latencies)
 
         return {
 
@@ -1038,4 +1058,10 @@ class DataAnalystAgent:
                 if self.review_result is not None
                 else None
             ),
+
+            "guardrail": {
+            "triggered": self.guardrail_triggered,
+            "type": self.guardrail_type,
+            "reason": self.guardrail_reason,
+            },
         }

@@ -56,15 +56,17 @@ class AgentRunRecord:
     error: str | None = None
 
     # ---------------------------------------------------------
+    # Guardrails
+    # ---------------------------------------------------------
+
+    guardrail: dict[str, Any] | None = None
+
+    # ---------------------------------------------------------
     # Tool errors / recovery
     # ---------------------------------------------------------
 
     tool_error_count: int = 0
-
-    errors: list[dict[str, Any]] = field(
-        default_factory=list
-    )
-
+    errors: list[dict[str, Any]] = field(default_factory=list)
     recovery_attempts: int = 0
     recovered: bool = False
 
@@ -107,6 +109,8 @@ class AgentRunRecord:
 
             "status": self.status,
             "error": self.error,
+
+            "guardrail": self.guardrail,
 
             "tool_error_count": self.tool_error_count,
             "errors": self.errors,

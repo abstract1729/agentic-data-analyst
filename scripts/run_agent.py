@@ -24,7 +24,7 @@ from utils.logger import AgentLogger
 
 load_dotenv(PROJECT_ROOT / ".env")
 
-PROVIDER = "gemini"
+PROVIDER = "qwen"
 
 QWEN_MODEL_NAME = "qwen2.5:14b-instruct"
 GEMINI_MODEL_NAME = "gemini-3.6-flash"

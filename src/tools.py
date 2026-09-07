@@ -5,6 +5,8 @@ import duckdb
 import numpy as np
 import pandas as pd
 
+from src.guardrails import validate_sql, validate_python
+
 class PythonImportNotAllowedError(Exception):
     """Raised when Python code contains a prohibited import."""
 
@@ -131,89 +133,33 @@ class DataAnalystTools:
     # SQL Execution
     # =============================================================
 
-    @staticmethod
-    def _validate_read_only_query(query: str) -> str:
+    def _validate_sql_with_guardrail(self, query: str) -> str:
         """
-        Validate that a query is read-only.
+        Validate SQL using the centralized SQL guardrail.
 
-        For the baseline, only SELECT and WITH queries are allowed.
+        Raises:
+            ValueError: If the guardrail blocks the query.
         """
 
-        if not isinstance(query, str):
-            raise TypeError(
-                "SQL query must be a string."
-            )
+        result = validate_sql(query)
 
-        query = query.strip()
-        # Qwen may occasionally return escaped newline/tab characters
-        # as literal sequences rather than actual whitespace.
-        query = (
-            query
-            .replace("\\n", "\n")
-            .replace("\\t", "\t")
-            .replace("\\r", "\r")
-        )
-
-        if not query:
+        if not result.allowed:
             raise ValueError(
-                "SQL query cannot be empty."
-            )
-
-        query_upper = query.upper()
-
-        if not (
-            query_upper.startswith("SELECT")
-            or query_upper.startswith("WITH")
-        ):
-            raise ValueError(
-                "Only SELECT or WITH queries are allowed."
-            )
-
-        forbidden = [
-            "INSERT",
-            "UPDATE",
-            "DELETE",
-            "DROP",
-            "ALTER",
-            "CREATE",
-            "TRUNCATE",
-            "REPLACE",
-            "MERGE",
-            "COPY",
-            "ATTACH",
-            "DETACH",
-            "INSTALL",
-            "LOAD",
-        ]
-
-        if any(
-            keyword in query_upper
-            for keyword in forbidden
-        ):
-            raise ValueError(
-                "Only read-only SQL queries are allowed."
+                f"SQL guardrail blocked the query: "
+                f"{result.reason}"
             )
 
         return query
 
-    def _query_dataframe(
-        self,
-        query: str,
-    ) -> pd.DataFrame:
+    def _query_dataframe(self,query: str,) -> pd.DataFrame:
         """
-        Execute a validated read-only SQL query and return
-        the result as a Pandas DataFrame.
+        Validate and execute a read-only SQL query.
 
-        This is the controlled database interface exposed
-        to the Python analysis environment.
+        The SQL guardrail always runs before DuckDB execution.
         """
 
-        query = self._validate_read_only_query(query)
-
-        conn = duckdb.connect(
-            self.database_path,
-            read_only=True,
-        )
+        query = self._validate_sql_with_guardrail(query)
+        conn = duckdb.connect(self.database_path,read_only=True,)
 
         try:
             return conn.execute(query).fetchdf()
@@ -265,34 +211,6 @@ class DataAnalystTools:
     # =============================================================
     # Python Execution
     # =============================================================
-
-    @staticmethod
-    def _validate_python_code(code: str) -> None:
-        """
-        Validate Python code before execution.
-
-        Import statements are explicitly prohibited because the
-        execution environment already provides the required
-        objects and intentionally disables Python imports.
-        """
-
-        try:
-            tree = ast.parse(code)
-
-        except SyntaxError:
-            # Let exec() handle the final SyntaxError reporting.
-            # This keeps the existing error format unchanged.
-            return
-
-        for node in ast.walk(tree):
-
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
-                raise PythonImportNotAllowedError(
-                    "Import statements are not allowed. "
-                    "Do not use `import` or `from ... import ...`. "
-                    "The following objects are already available: "
-                    "`pd`, `np`, and `query(sql)`."
-                )
 
     def execute_python(self, code: str) -> str:
         """
@@ -382,7 +300,14 @@ class DataAnalystTools:
         }
 
         try:
-            self._validate_python_code(code)
+            guardrail_result = validate_python(code)
+
+            if not guardrail_result.allowed:
+                return (
+                    "PYTHON_EXECUTION_ERROR\n"
+                    "Error Type: PythonGuardrailViolation\n"
+                    f"Message: {guardrail_result.reason}"
+                )
 
             exec(
                 code,
